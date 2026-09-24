@@ -51,6 +51,7 @@ io.on('connection', (socket) => {
             pot: 0,
             currentBet: 0,
             activeTurnIndex: 0,
+            stage: "preflop",
             gameStarted: false
         };
 
@@ -85,9 +86,10 @@ io.on('connection', (socket) => {
 
         room.gameStarted = true;
         room.deck = createDeck();
-        room.community = [room.deck.pop(), room.deck.pop(), room.deck.pop()];
+        room.community = [];
         room.pot = 0;
         room.currentBet = 0;
+        room.stage = "preflop";
 
         room.players.forEach(p => {
             p.hand = [room.deck.pop(), room.deck.pop()];
@@ -101,18 +103,18 @@ io.on('connection', (socket) => {
 
     socket.on('playerAction', (data) => {
         const room = rooms[data.roomId];
-        if (!room) return;
+        if (!room || !room.gameStarted) return;
 
         const player = room.players[room.activeTurnIndex];
         if (!player || player.id !== socket.id) return;
 
         const action = data.action;
 
-        // 1. PROSES AKSI FOLD
+        // 1. Aksi FOLD
         if (action === 'fold') {
             player.folded = true;
         } 
-        // 2. PROSES AKSI CHECK / CALL
+        // 2. Aksi CHECK / CALL
         else if (action === 'check') {
             let need = room.currentBet - player.bet;
             if (need > player.chips) need = player.chips;
@@ -120,7 +122,7 @@ io.on('connection', (socket) => {
             player.bet += need;
             room.pot += need;
         } 
-        // 3. PROSES AKSI RAISE
+        // 3. Aksi RAISE
         else if (action === 'raise') {
             let raiseAmt = parseInt(data.amount) || 50;
             let targetBet = room.currentBet + raiseAmt;
@@ -137,20 +139,28 @@ io.on('connection', (socket) => {
             room.currentBet = targetBet;
         }
 
-        // Pindah giliran ke pemain berikutnya yang belum FOLD
+        // Cek jika tersisa 1 pemain yang tidak fold
         const activePlayers = room.players.filter(p => !p.folded);
-        
         if (activePlayers.length <= 1) {
-            // Jika tinggal 1 orang yang tidak fold, langsung menang
             const winner = activePlayers[0];
             if (winner) winner.chips += room.pot;
-            io.to(data.roomId).emit('gameOver', { winner: winner ? winner.name : "Seseorang", pot: room.pot });
+            room.gameStarted = false;
+            io.to(data.roomId).emit('gameOver', { winner: winner ? winner.name : "Pemain", pot: room.pot });
             return;
         }
 
-        do {
-            room.activeTurnIndex = (room.activeTurnIndex + 1) % room.players.length;
-        } while (room.players[room.activeTurnIndex].folded);
+        // Cek apakah babak taruhan ronde ini selesai (semua pemain yang aktif nilai taruhannya sama)
+        const isRoundComplete = activePlayers.every(p => p.bet === room.currentBet);
+
+        if (isRoundComplete) {
+            // Pindah ke babak berikutnya
+            advanceStage(room);
+        } else {
+            // Pindah giliran ke pemain aktif berikutnya
+            do {
+                room.activeTurnIndex = (room.activeTurnIndex + 1) % room.players.length;
+            } while (room.players[room.activeTurnIndex].folded);
+        }
 
         io.to(data.roomId).emit('gameStateUpdate', room);
     });
@@ -171,6 +181,37 @@ io.on('connection', (socket) => {
         }
     });
 });
+
+function advanceStage(room) {
+    // Reset taruhan tiap ronde
+    room.players.forEach(p => p.bet = 0);
+    room.currentBet = 0;
+
+    if (room.stage === "preflop") {
+        room.stage = "flop";
+        room.community.push(room.deck.pop(), room.deck.pop(), room.deck.pop());
+    } else if (room.stage === "flop") {
+        room.stage = "turn";
+        room.community.push(room.deck.pop());
+    } else if (room.stage === "turn") {
+        room.stage = "river";
+        room.community.push(room.deck.pop());
+    } else {
+        // Showdown / Game Selesai
+        const active = room.players.filter(p => !p.folded);
+        const winner = active[Math.floor(Math.random() * active.length)]; // Pemenang ronde
+        if (winner) winner.chips += room.pot;
+        room.gameStarted = false;
+        io.to(room.id).emit('gameOver', { winner: winner.name, pot: room.pot });
+        return;
+    }
+
+    // Cari pemain aktif pertama untuk memulai ronde taruhan baru
+    room.activeTurnIndex = 0;
+    while (room.players[room.activeTurnIndex].folded) {
+        room.activeTurnIndex = (room.activeTurnIndex + 1) % room.players.length;
+    }
+}
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
