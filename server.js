@@ -6,10 +6,7 @@ const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
+    cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
 const rooms = {};
@@ -36,8 +33,6 @@ function createDeck() {
 }
 
 io.on('connection', (socket) => {
-    console.log('Player terhubung:', socket.id);
-
     socket.on('createRoom', (data) => {
         const roomId = Math.floor(1000 + Math.random() * 9000).toString();
         rooms[roomId] = {
@@ -54,7 +49,7 @@ io.on('connection', (socket) => {
             deck: [],
             community: [],
             pot: 0,
-            currentBet: 20,
+            currentBet: 0,
             activeTurnIndex: 0,
             gameStarted: false
         };
@@ -65,18 +60,9 @@ io.on('connection', (socket) => {
 
     socket.on('joinRoom', (data) => {
         const room = rooms[data.roomId];
-        if (!room) {
-            socket.emit('errorMsg', 'Kode Room tidak ditemukan!');
-            return;
-        }
-        if (room.players.length >= 5) {
-            socket.emit('errorMsg', 'Room sudah penuh (Maksimal 5 pemain)!');
-            return;
-        }
-        if (room.gameStarted) {
-            socket.emit('errorMsg', 'Permainan sedang berjalan!');
-            return;
-        }
+        if (!room) return socket.emit('errorMsg', 'Kode Room tidak ditemukan!');
+        if (room.players.length >= 5) return socket.emit('errorMsg', 'Room penuh!');
+        if (room.gameStarted) return socket.emit('errorMsg', 'Game sedang berjalan!');
 
         const newPlayer = {
             id: socket.id,
@@ -99,9 +85,9 @@ io.on('connection', (socket) => {
 
         room.gameStarted = true;
         room.deck = createDeck();
-        room.community = [room.deck.pop(), room.deck.pop(), room.deck.pop()]; // Flop awal
+        room.community = [room.deck.pop(), room.deck.pop(), room.deck.pop()];
         room.pot = 0;
-        room.currentBet = 20;
+        room.currentBet = 0;
 
         room.players.forEach(p => {
             p.hand = [room.deck.pop(), room.deck.pop()];
@@ -120,25 +106,51 @@ io.on('connection', (socket) => {
         const player = room.players[room.activeTurnIndex];
         if (!player || player.id !== socket.id) return;
 
-        if (data.action === 'fold') {
+        const action = data.action;
+
+        // 1. PROSES AKSI FOLD
+        if (action === 'fold') {
             player.folded = true;
-        } else if (data.action === 'check' || data.action === 'call') {
+        } 
+        // 2. PROSES AKSI CHECK / CALL
+        else if (action === 'check') {
             let need = room.currentBet - player.bet;
+            if (need > player.chips) need = player.chips;
             player.chips -= need;
             player.bet += need;
             room.pot += need;
-        } else if (data.action === 'raise') {
+        } 
+        // 3. PROSES AKSI RAISE
+        else if (action === 'raise') {
             let raiseAmt = parseInt(data.amount) || 50;
-            let need = (room.currentBet + raiseAmt) - player.bet;
+            let targetBet = room.currentBet + raiseAmt;
+            let need = targetBet - player.bet;
+
+            if (need > player.chips) {
+                need = player.chips;
+                targetBet = player.bet + need;
+            }
+
             player.chips -= need;
             player.bet += need;
             room.pot += need;
-            room.currentBet = player.bet;
+            room.currentBet = targetBet;
+        }
+
+        // Pindah giliran ke pemain berikutnya yang belum FOLD
+        const activePlayers = room.players.filter(p => !p.folded);
+        
+        if (activePlayers.length <= 1) {
+            // Jika tinggal 1 orang yang tidak fold, langsung menang
+            const winner = activePlayers[0];
+            if (winner) winner.chips += room.pot;
+            io.to(data.roomId).emit('gameOver', { winner: winner ? winner.name : "Seseorang", pot: room.pot });
+            return;
         }
 
         do {
             room.activeTurnIndex = (room.activeTurnIndex + 1) % room.players.length;
-        } while (room.players[room.activeTurnIndex].folded && room.players.filter(p => !p.folded).length > 1);
+        } while (room.players[room.activeTurnIndex].folded);
 
         io.to(data.roomId).emit('gameStateUpdate', room);
     });
