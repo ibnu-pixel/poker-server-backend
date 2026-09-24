@@ -37,7 +37,7 @@ function startRound(room) {
     room.deck = createDeck();
     room.community = [];
     room.pot = 0;
-    room.currentBet = 20; // Big Blind Awal
+    room.currentBet = 20;
     room.stage = "preflop";
 
     room.players.forEach((p, idx) => {
@@ -46,20 +46,19 @@ function startRound(room) {
         p.folded = false;
         p.isAllIn = false;
         
-        // Auto-post Blind Awal
-        let blind = (idx === 0) ? 10 : 20; // Player 0 Small Blind ($10), Player 1 Big Blind ($20)
+        let blind = (idx === 0) ? 10 : 20;
         let actual = Math.min(p.chips, blind);
         p.chips -= actual;
         p.bet = actual;
         room.pot += actual;
     });
 
+    // Player 0 Small Blind, Player 1 Big Blind. Giliran pertama = Player 0 (atau berputar)
     room.activeTurnIndex = 0;
     io.to(room.id).emit('gameStateUpdate', room);
 }
 
 io.on('connection', (socket) => {
-    // 1. Buat Room
     socket.on('createRoom', (data) => {
         const roomId = Math.floor(1000 + Math.random() * 9000).toString();
         rooms[roomId] = {
@@ -87,11 +86,10 @@ io.on('connection', (socket) => {
         socket.emit('roomCreated', { roomId, players: rooms[roomId].players, isHost: true });
     });
 
-    // 2. Join Room & Otomatis Mulai Game
     socket.on('joinRoom', (data) => {
         const room = rooms[data.roomId];
         if (!room) return socket.emit('errorMsg', 'Kode Room tidak ditemukan!');
-        if (room.players.length >= 5) return socket.emit('errorMsg', 'Room penuh (Maksimal 5 pemain)!');
+        if (room.players.length >= 5) return socket.emit('errorMsg', 'Room penuh!');
         if (room.gameStarted) return socket.emit('errorMsg', 'Permainan sedang berjalan!');
 
         const newPlayer = {
@@ -110,23 +108,22 @@ io.on('connection', (socket) => {
         
         io.to(data.roomId).emit('playerJoined', { roomId: data.roomId, players: room.players });
 
-        // OTOMATIS MULAI GAME begitu ada pemain ke-2 bergabung
         if (room.players.length >= 2 && !room.gameStarted) {
-            io.to(data.roomId).emit('autoStartNotice', { msg: "Pemain lengkap! Permainan dimulai dalam 2 detik..." });
+            io.to(data.roomId).emit('autoStartNotice', { msg: "Pemain lengkap! Permainan dimulai..." });
             setTimeout(() => {
                 if (rooms[data.roomId] && !rooms[data.roomId].gameStarted) {
                     startRound(rooms[data.roomId]);
                 }
-            }, 2000);
+            }, 1500);
         }
     });
 
-    // 3. Aksi Pemain (Fold, Check/Call, Raise, All-in)
     socket.on('playerAction', (data) => {
         const room = rooms[data.roomId];
         if (!room || !room.gameStarted) return;
 
         const player = room.players[room.activeTurnIndex];
+        // Validasi: pastikan socket yang mengirim pesan benar-benar pemain yang sedang dapat giliran
         if (!player || player.id !== socket.id) return;
 
         const action = data.action;
@@ -164,7 +161,6 @@ io.on('connection', (socket) => {
             if (player.bet > room.currentBet) room.currentBet = player.bet;
         }
 
-        // Cek jika tersisa 1 pemain aktif yang tidak Fold
         const activePlayers = room.players.filter(p => !p.folded);
         if (activePlayers.length <= 1) {
             const winner = activePlayers[0];
@@ -174,7 +170,6 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // Cek ronde taruhan selesai
         const isRoundComplete = activePlayers.every(p => p.bet === room.currentBet || p.isAllIn);
 
         if (isRoundComplete) {
@@ -219,7 +214,6 @@ function advanceStage(room) {
         room.stage = "river";
         room.community.push(room.deck.pop());
     } else {
-        // Showdown
         const active = room.players.filter(p => !p.folded);
         const winner = active[Math.floor(Math.random() * active.length)];
         if (winner) winner.chips += room.pot;
