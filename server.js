@@ -32,7 +32,34 @@ function createDeck() {
     return d;
 }
 
+function startRound(room) {
+    room.gameStarted = true;
+    room.deck = createDeck();
+    room.community = [];
+    room.pot = 0;
+    room.currentBet = 20; // Big Blind Awal
+    room.stage = "preflop";
+
+    room.players.forEach((p, idx) => {
+        p.hand = [room.deck.pop(), room.deck.pop()];
+        p.bet = 0;
+        p.folded = false;
+        p.isAllIn = false;
+        
+        // Auto-post Blind Awal
+        let blind = (idx === 0) ? 10 : 20; // Player 0 Small Blind ($10), Player 1 Big Blind ($20)
+        let actual = Math.min(p.chips, blind);
+        p.chips -= actual;
+        p.bet = actual;
+        room.pot += actual;
+    });
+
+    room.activeTurnIndex = 0;
+    io.to(room.id).emit('gameStateUpdate', room);
+}
+
 io.on('connection', (socket) => {
+    // 1. Buat Room
     socket.on('createRoom', (data) => {
         const roomId = Math.floor(1000 + Math.random() * 9000).toString();
         rooms[roomId] = {
@@ -44,12 +71,13 @@ io.on('connection', (socket) => {
                 chips: 1000,
                 bet: 0,
                 folded: false,
+                isAllIn: false,
                 isHost: true
             }],
             deck: [],
             community: [],
             pot: 0,
-            currentBet: 0,
+            currentBet: 20,
             activeTurnIndex: 0,
             stage: "preflop",
             gameStarted: false
@@ -59,48 +87,41 @@ io.on('connection', (socket) => {
         socket.emit('roomCreated', { roomId, players: rooms[roomId].players, isHost: true });
     });
 
+    // 2. Join Room & Otomatis Mulai Game
     socket.on('joinRoom', (data) => {
         const room = rooms[data.roomId];
         if (!room) return socket.emit('errorMsg', 'Kode Room tidak ditemukan!');
-        if (room.players.length >= 5) return socket.emit('errorMsg', 'Room penuh!');
-        if (room.gameStarted) return socket.emit('errorMsg', 'Game sedang berjalan!');
+        if (room.players.length >= 5) return socket.emit('errorMsg', 'Room penuh (Maksimal 5 pemain)!');
+        if (room.gameStarted) return socket.emit('errorMsg', 'Permainan sedang berjalan!');
 
         const newPlayer = {
             id: socket.id,
-            name: data.playerName || "Pemain",
+            name: data.playerName || `Pemain ${room.players.length + 1}`,
             hand: [],
             chips: 1000,
             bet: 0,
             folded: false,
+            isAllIn: false,
             isHost: false
         };
 
         room.players.push(newPlayer);
         socket.join(data.roomId);
+        
         io.to(data.roomId).emit('playerJoined', { roomId: data.roomId, players: room.players });
+
+        // OTOMATIS MULAI GAME begitu ada pemain ke-2 bergabung
+        if (room.players.length >= 2 && !room.gameStarted) {
+            io.to(data.roomId).emit('autoStartNotice', { msg: "Pemain lengkap! Permainan dimulai dalam 2 detik..." });
+            setTimeout(() => {
+                if (rooms[data.roomId] && !rooms[data.roomId].gameStarted) {
+                    startRound(rooms[data.roomId]);
+                }
+            }, 2000);
+        }
     });
 
-    socket.on('startGame', (data) => {
-        const room = rooms[data.roomId];
-        if (!room) return;
-
-        room.gameStarted = true;
-        room.deck = createDeck();
-        room.community = [];
-        room.pot = 0;
-        room.currentBet = 0;
-        room.stage = "preflop";
-
-        room.players.forEach(p => {
-            p.hand = [room.deck.pop(), room.deck.pop()];
-            p.bet = 0;
-            p.folded = false;
-        });
-
-        room.activeTurnIndex = 0;
-        io.to(data.roomId).emit('gameStateUpdate', room);
-    });
-
+    // 3. Aksi Pemain (Fold, Check/Call, Raise, All-in)
     socket.on('playerAction', (data) => {
         const room = rooms[data.roomId];
         if (!room || !room.gameStarted) return;
@@ -110,20 +131,16 @@ io.on('connection', (socket) => {
 
         const action = data.action;
 
-        // 1. Aksi FOLD
         if (action === 'fold') {
             player.folded = true;
-        } 
-        // 2. Aksi CHECK / CALL
-        else if (action === 'check') {
+        } else if (action === 'check' || action === 'call') {
             let need = room.currentBet - player.bet;
             if (need > player.chips) need = player.chips;
             player.chips -= need;
             player.bet += need;
             room.pot += need;
-        } 
-        // 3. Aksi RAISE
-        else if (action === 'raise') {
+            if (player.chips === 0) player.isAllIn = true;
+        } else if (action === 'raise') {
             let raiseAmt = parseInt(data.amount) || 50;
             let targetBet = room.currentBet + raiseAmt;
             let need = targetBet - player.bet;
@@ -137,9 +154,17 @@ io.on('connection', (socket) => {
             player.bet += need;
             room.pot += need;
             room.currentBet = targetBet;
+            if (player.chips === 0) player.isAllIn = true;
+        } else if (action === 'allin') {
+            let amt = player.chips;
+            player.bet += amt;
+            room.pot += amt;
+            player.chips = 0;
+            player.isAllIn = true;
+            if (player.bet > room.currentBet) room.currentBet = player.bet;
         }
 
-        // Cek jika tersisa 1 pemain yang tidak fold
+        // Cek jika tersisa 1 pemain aktif yang tidak Fold
         const activePlayers = room.players.filter(p => !p.folded);
         if (activePlayers.length <= 1) {
             const winner = activePlayers[0];
@@ -149,17 +174,15 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // Cek apakah babak taruhan ronde ini selesai (semua pemain yang aktif nilai taruhannya sama)
-        const isRoundComplete = activePlayers.every(p => p.bet === room.currentBet);
+        // Cek ronde taruhan selesai
+        const isRoundComplete = activePlayers.every(p => p.bet === room.currentBet || p.isAllIn);
 
         if (isRoundComplete) {
-            // Pindah ke babak berikutnya
             advanceStage(room);
         } else {
-            // Pindah giliran ke pemain aktif berikutnya
             do {
                 room.activeTurnIndex = (room.activeTurnIndex + 1) % room.players.length;
-            } while (room.players[room.activeTurnIndex].folded);
+            } while (room.players[room.activeTurnIndex].folded || room.players[room.activeTurnIndex].isAllIn);
         }
 
         io.to(data.roomId).emit('gameStateUpdate', room);
@@ -183,7 +206,6 @@ io.on('connection', (socket) => {
 });
 
 function advanceStage(room) {
-    // Reset taruhan tiap ronde
     room.players.forEach(p => p.bet = 0);
     room.currentBet = 0;
 
@@ -197,18 +219,17 @@ function advanceStage(room) {
         room.stage = "river";
         room.community.push(room.deck.pop());
     } else {
-        // Showdown / Game Selesai
+        // Showdown
         const active = room.players.filter(p => !p.folded);
-        const winner = active[Math.floor(Math.random() * active.length)]; // Pemenang ronde
+        const winner = active[Math.floor(Math.random() * active.length)];
         if (winner) winner.chips += room.pot;
         room.gameStarted = false;
         io.to(room.id).emit('gameOver', { winner: winner.name, pot: room.pot });
         return;
     }
 
-    // Cari pemain aktif pertama untuk memulai ronde taruhan baru
     room.activeTurnIndex = 0;
-    while (room.players[room.activeTurnIndex].folded) {
+    while (room.players[room.activeTurnIndex].folded || room.players[room.activeTurnIndex].isAllIn) {
         room.activeTurnIndex = (room.activeTurnIndex + 1) % room.players.length;
     }
 }
